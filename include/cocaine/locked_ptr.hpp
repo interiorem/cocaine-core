@@ -195,6 +195,8 @@ private:
     mutex_type mutable m_mutex;
 };
 
+using synchronized_bool = synchronized<bool>;
+
 } // namespace cocaine
 
 #endif

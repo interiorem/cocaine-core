@@ -82,11 +82,14 @@ class locator_t::connect_sink_t: public dispatch<event_traits<locator::connect>:
     locator_t  *const parent;
     std::string const uuid;
 
+    std::shared_ptr<synchronized_bool> terminating;
+
 public:
-    connect_sink_t(locator_t *const parent_, const std::string& uuid_):
+    connect_sink_t(locator_t *const parent_, const std::string& uuid_, std::shared_ptr<synchronized_bool> terminating_):
         dispatch<event_traits<locator::connect>::upstream_type>(parent_->name() + ":client"),
         parent(parent_),
-        uuid(uuid_)
+        uuid(uuid_),
+        terminating(std::move(terminating_))
     {
         typedef io::protocol<event_traits<locator::connect>::upstream_type>::scope protocol;
 
@@ -96,6 +99,11 @@ public:
 
     virtual
    ~connect_sink_t() {
+        auto locked_terminating = terminating->synchronize();
+        if (*locked_terminating) {
+            return;
+        }
+
         parent->m_gateway->cleanup(uuid);
     }
 
@@ -113,6 +121,11 @@ private:
 
 void
 locator_t::connect_sink_t::discard(const std::error_code& ec) {
+    auto locked_terminating = terminating->synchronize();
+    if (*locked_terminating) {
+        return;
+    }
+
     if(ec.value() == 0) return;
 
     COCAINE_LOG_ERROR(parent->m_log, "remote client discarded: [{:d}] {}", ec.value(), ec.message(), attribute_list({
@@ -127,6 +140,11 @@ void
 locator_t::connect_sink_t::on_announce(hpack::headers_t headers, const std::string& node,
                                        std::map<std::string, results::resolve>&& update)
 {
+    auto locked_terminating = terminating->synchronize();
+    if (*locked_terminating) {
+        return;
+    }
+
     if(node != uuid) {
         COCAINE_LOG_ERROR(parent->m_log, "remote client id mismatch: '{}' vs. '{}'", uuid, node);
 
@@ -168,6 +186,11 @@ locator_t::connect_sink_t::on_announce(hpack::headers_t headers, const std::stri
 
 void
 locator_t::connect_sink_t::on_shutdown() {
+    auto locked_terminating = terminating->synchronize();
+    if (*locked_terminating) {
+        return;
+    }
+
     COCAINE_LOG_INFO(parent->m_log, "remote client closed its stream", {
         {"uuid", uuid}
     });
@@ -398,15 +421,21 @@ locator_t::locator_t(context_t& context, io_service& asio, const std::string& na
 }
 
 locator_t::~locator_t() {
-    const auto lock = m_clients.synchronize();
+    m_clients.apply([this](client_map_t& clients) {
+        m_retry_timers.clear();
+        for (auto& socket: m_sockets) {
+            // nothrow overload
+            std::error_code ec;
+            socket.second->close(ec);
+        }
+        m_sockets.clear();
 
-    m_retry_timers.clear();
-    for (auto& socket: m_sockets) {
-        // nothrow overload
-        std::error_code ec;
-        socket.second->close(ec);
-    }
-    m_sockets.clear();
+        for (auto& client: clients) {
+            if (client.second.terminating) {
+                *client.second.terminating->synchronize() = true;
+            }
+        }
+    });
 }
 
 basic_dispatch_t&
@@ -470,7 +499,7 @@ locator_t::link_node_unsafe(const std::string& uuid, const std::vector<asio::ip:
 
     auto socket = m_sockets[uuid] = std::make_shared<tcp::socket>(m_executor.asio());
     auto connect_timer = std::make_shared<asio::deadline_timer>(m_executor.asio());
-    auto& uplink = (m_clients.unsafe()[uuid] = {endpoints, nullptr});
+    auto& uplink = (m_clients.unsafe()[uuid] = {endpoints, nullptr, nullptr});
 
     connect_timer->expires_from_now(boost::posix_time::seconds(10));
     connect_timer->async_wait([=](std::error_code ec) {
@@ -494,29 +523,29 @@ locator_t::link_node_unsafe(const std::string& uuid, const std::vector<asio::ip:
     {
         const holder_t scoped(*m_log, {{"uuid", uuid}});
 
-        auto session = m_clients.apply(
-            [&](client_map_t& mapping) -> std::shared_ptr<cocaine::session<tcp>>
-        {
+        std::shared_ptr<cocaine::session<tcp>> session;
+        std::shared_ptr<synchronized_bool> terminating;
+        m_clients.apply([&](client_map_t& mapping) {
             m_sockets.erase(uuid);
 
             if(mapping.count(uuid) == 0) {
                 COCAINE_LOG_ERROR(m_log, "remote disappeared while connecting");
                 connect_timer->cancel();
-                return nullptr;
+                return;
             }
 
             if(!connect_timer->cancel()) {
                 COCAINE_LOG_ERROR(m_log, "could not connect locator to {} - timed out (timer could not be cancelled)", uuid);
                 mapping.erase(uuid);
                 retry_link_node(uuid, endpoints);
-                return nullptr;
+                return;
             }
 
             if(ec) {
                 COCAINE_LOG_ERROR(m_log, "unable to connect to remote: [{:d}] {}", ec.value(), ec.message());
                 mapping.erase(uuid);
                 retry_link_node(uuid, endpoints);
-                return nullptr;
+                return;
             }
 
             COCAINE_LOG_INFO(m_log, "connected to remote via {}", *endpoint);
@@ -524,23 +553,24 @@ locator_t::link_node_unsafe(const std::string& uuid, const std::vector<asio::ip:
             // Uniquify the socket object.
             auto ptr = std::make_unique<tcp::socket>(std::move(*socket));
 
-            std::shared_ptr<cocaine::session<tcp>> session;
             try {
                 session = m_context.engine().attach(std::move(ptr), nullptr);
-                mapping.at(uuid).ptr = session;
+                terminating = std::make_shared<synchronized_bool>(false);
+
+                auto& uplink = mapping.at(uuid);
+                uplink.ptr = session;
+                uplink.terminating = terminating;
             } catch (const std::system_error& err) {
                 COCAINE_LOG_ERROR(m_log, "unable to set up remote client: {}", error::to_string(err));
                 mapping.erase(uuid);
                 retry_link_node(uuid, endpoints);
             }
-
-            return session;
         });
 
         // Something went wrong in the session creation code above, bail out.
         if(!session) return;
 
-        auto upstream = session->fork(std::make_shared<connect_sink_t>(this, uuid));
+        auto upstream = session->fork(std::make_shared<connect_sink_t>(this, uuid, terminating));
 
         try {
             upstream->send<locator::connect>(this->uuid());

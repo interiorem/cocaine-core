@@ -80,6 +80,8 @@ class locator_t:
     public:
         std::vector<asio::ip::tcp::endpoint> endpoints;
         std::shared_ptr<session<asio::ip::tcp>> ptr;
+
+        std::shared_ptr<synchronized_bool> terminating;
     };
 
     typedef std::map<std::string, uplink_t> client_map_t;

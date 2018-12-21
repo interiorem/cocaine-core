@@ -1,3 +1,10 @@
+cocaine-core (0.12.14.32) unstable; urgency=medium
+
+  * fix: fix crash, wait locator_t::connect_sink_t callbacks in locator destructor
+  * fix: terminate unpublished services
+
+ -- Artem Selishchev <arselishev@gmail.com>  Fri, 21 Dec 2018 14:28:18 +0300
+
 cocaine-core (0.12.14.31) unstable; urgency=medium
 
   * fix: fix crash in locator_t after destruction

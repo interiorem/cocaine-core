@@ -319,13 +319,15 @@ public:
             return service;
         };
 
-        // TODO: Terminate unpublished services too
         auto service = m_services.apply(extract_service);
-        if (service) {
-            service->terminate();
-        } else if (!(service = extract_service(m_unpublished))) {
+        if (!service) {
+            service = extract_service(m_unpublished);
+        }
+        if (!service) {
             throw cocaine::error_t("service '{}' doesn't exist", name);
         }
+
+        service->terminate();
 
         COCAINE_LOG_DEBUG(m_log, "service has been stopped", {
             { "service", name }

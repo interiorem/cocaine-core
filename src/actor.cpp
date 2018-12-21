@@ -214,6 +214,10 @@ template<typename Protocol>
 void
 actor_base<Protocol>::terminate() {
     m_acceptor.apply([this](std::shared_ptr<accept_action_t>& action) {
+        if (!action) {
+            return;
+        }
+
         const auto endpoint = action->local_endpoint();
 
         COCAINE_LOG_INFO(m_log, "removing service from local endpoint {}", endpoint);
